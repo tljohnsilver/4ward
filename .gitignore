@@ -1,0 +1,6 @@
+/target
+node_modules
+binaries
+*.zip
+.env
+4ward.json

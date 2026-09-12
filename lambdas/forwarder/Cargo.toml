@@ -1,0 +1,26 @@
+[package]
+name = "lambda-forwarder"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+
+[dependencies]
+lambda_runtime = "0.14"
+aws_lambda_events = "0.18"
+aws-config = "1"
+aws-sdk-s3 = "1"
+aws-sdk-sesv2 = "1"
+mail-parser = "0.11"
+mail-builder = "0.3"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+fourward-core = { path = "../../crates/4ward-core" }
+base64 = "0.22"
+
+[dev-dependencies]

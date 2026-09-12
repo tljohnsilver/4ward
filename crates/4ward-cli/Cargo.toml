@@ -1,0 +1,26 @@
+[package]
+name = "fourward-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "4ward"
+path = "src/main.rs"
+
+[dependencies]
+fourward-core = { path = "../4ward-core" }
+clap = { version = "4", features = ["derive"] }
+inquire = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aws-config = "1"
+aws-sdk-sts = "1"
+aws-sdk-sesv2 = "1"
+aws-sdk-ssm = "1"
+aws-sdk-cloudformation = "1"
+aws-sdk-route53 = "1"
+comfy-table = "7"
+rand = "0.8"
+hex = "0.4"
+anyhow = "1"

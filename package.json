@@ -1,0 +1,13 @@
+{
+  "name": "4ward",
+  "version": "0.1.0",
+  "description": "Serverless email infrastructure for AWS in Rust",
+  "bin": {
+    "4ward": "./bin/run.js"
+  },
+  "scripts": {
+    "postinstall": "node ./scripts/install-binary.js"
+  },
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"]
+}

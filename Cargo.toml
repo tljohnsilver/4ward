@@ -1,0 +1,8 @@
+[workspace]
+members = [
+  "crates/4ward-core",
+  "crates/4ward-cli",
+  "lambdas/forwarder",
+  "lambdas/api",
+]
+resolver = "2"

@@ -1,0 +1,15 @@
+[package]
+name = "fourward-core"
+version = "0.1.0"
+edition = "2021"
+description = "Domain logic, models and configuration schemas for 4ward"
+
+[lib]
+name = "fourward_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+validator = { version = "0.20", features = ["derive"] }

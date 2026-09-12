@@ -1,0 +1,321 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "4ward - zero-idle-cost serverless email engine (SES inbound SRS forwarder + transactional API)"
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 4ward
+    Description: Project / stack prefix
+  DomainName:
+    Type: String
+    Description: Primary verified domain (e.g. example.com)
+  RelayDomain:
+    Type: String
+    Description: Relay From domain (defaults to DomainName)
+    Default: ""
+  AliasMapJson:
+    Type: String
+    Default: "{}"
+    Description: JSON map alias@domain -> [destinations]
+  CatchAll:
+    Type: String
+    Default: ""
+    Description: Optional fallback destination
+  BannerEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  ApiEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  AllowedDomains:
+    Type: String
+    Default: ""
+    Description: Comma-separated verified From domains for POST /v1/emails
+  ApiKeysPrefix:
+    Type: String
+    Default: /4ward/api-keys/
+  RetentionDays:
+    Type: Number
+    Default: 1
+  ForwarderS3Key:
+    Type: String
+    Default: bootstrap.zip
+    Description: S3 key for forwarder lambda zip (same bucket as template or use local packaging)
+  ApiS3Key:
+    Type: String
+    Default: bootstrap.zip
+  LambdaCodeBucket:
+    Type: String
+    Default: ""
+    Description: S3 bucket holding lambda zips; leave empty to skip S3 code (inline placeholder)
+
+Conditions:
+  HasCodeBucket: !Not [!Equals [!Ref LambdaCodeBucket, ""]]
+  HasCatchAll: !Not [!Equals [!Ref CatchAll, ""]]
+  ApiOn: !Equals [!Ref ApiEnabled, "true"]
+  HasRelayDomain: !Not [!Equals [!Ref RelayDomain, ""]]
+
+Resources:
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawAfter24h
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  RawBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSESInboundWrite
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${RawBucket.Arn}/*"
+
+  EmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref DomainName
+      DkimSigningAttributes:
+        NextSigningKeyLength: RSA_2048_BIT
+      DkimAttributes:
+        SigningEnabled: true
+
+  ForwarderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ForwarderAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub "${RawBucket.Arn}/*"
+              - Effect: Allow
+                Action: [ses:SendEmail, ses:SendRawEmail]
+                Resource: "*"
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ApiAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ses:SendEmail, ses:SendRawEmail]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ssm:DescribeParameters, ssm:GetParameter]
+                Resource: "*"
+
+  ForwarderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-forwarder"
+      Architectures: [arm64]
+      Runtime: provided.al2023
+      Handler: bootstrap
+      MemorySize: 512
+      Timeout: 30
+      Role: !GetAtt ForwarderRole.Arn
+      Code:
+        S3Bucket: !If [HasCodeBucket, !Ref LambdaCodeBucket, !Ref AWS::NoValue]
+        S3Key: !If [HasCodeBucket, !Ref ForwarderS3Key, !Ref AWS::NoValue]
+        ZipFile: !If
+          - HasCodeBucket
+          - !Ref AWS::NoValue
+          - |
+            #!/bin/sh
+            echo 4ward-forwarder-placeholder
+      Environment:
+        Variables:
+          RELAY_DOMAIN: !If [HasRelayDomain, !Ref RelayDomain, !Ref DomainName]
+          ALIAS_MAP_JSON: !Ref AliasMapJson
+          CATCH_ALL: !Ref CatchAll
+          BANNER_ENABLED: !Ref BannerEnabled
+          RUST_LOG: info
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Condition: ApiOn
+    Properties:
+      FunctionName: !Sub "${ProjectName}-api"
+      Architectures: [arm64]
+      Runtime: provided.al2023
+      Handler: bootstrap
+      MemorySize: 512
+      Timeout: 30
+      Role: !GetAtt ApiRole.Arn
+      Code:
+        S3Bucket: !If [HasCodeBucket, !Ref LambdaCodeBucket, !Ref AWS::NoValue]
+        S3Key: !If [HasCodeBucket, !Ref ApiS3Key, !Ref AWS::NoValue]
+        ZipFile: !If
+          - HasCodeBucket
+          - !Ref AWS::NoValue
+          - |
+            #!/bin/sh
+            echo 4ward-api-placeholder
+      Environment:
+        Variables:
+          ALLOWED_DOMAINS: !Ref AllowedDomains
+          API_KEYS_PREFIX: !Ref ApiKeysPrefix
+          RUST_LOG: info
+
+  ForwarderInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ForwarderFunction
+      Action: lambda:InvokeFunction
+      Principal: ses.amazonaws.com
+
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ForwarderFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt RawBucket.Arn
+
+  ReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Properties:
+      Name: !Sub "${ProjectName}-inbound"
+
+  ReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    DependsOn: ForwarderInvokePermission
+    Properties:
+      RuleSetName: !Ref ReceiptRuleSet
+      Rule:
+        Name: !Sub "${ProjectName}-forward"
+        Enabled: true
+        Recipients:
+          - !Ref DomainName
+        Actions:
+          - S3Action:
+              BucketName: !Ref RawBucket
+              ObjectKeyPrefix: inbound/
+          - LambdaAction:
+              FunctionArn: !GetAtt ForwarderFunction.Arn
+              InvocationType: Event
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Condition: ApiOn
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: ["*"]
+        AllowMethods: [POST, OPTIONS]
+        AllowHeaders: [authorization, content-type]
+
+  HttpStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Condition: ApiOn
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  HttpIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: ApiOn
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  HttpRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: ApiOn
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /v1/emails
+      Target: !Sub "integrations/${HttpIntegration}"
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ApiOn
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+  BounceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-bounce-rate"
+      Namespace: AWS/SES
+      MetricName: Reputation.BounceRate
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0.05
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions: []
+
+  ComplaintAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-complaint-rate"
+      Namespace: AWS/SES
+      MetricName: Reputation.ComplaintRate
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0.001
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions: []
+
+Outputs:
+  RawBucketName:
+    Value: !Ref RawBucket
+  ForwarderName:
+    Value: !Ref ForwarderFunction
+  ApiEndpoint:
+    Condition: ApiOn
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+  DkimNote:
+    Value: Fetch DKIM CNAME tokens via SES console or `4ward dns` after deploy.
