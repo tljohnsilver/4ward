@@ -83,6 +83,18 @@ pub fn placeholder_dkim_tokens() -> Vec<String> {
     ]
 }
 
+/// ARC seal DNS record: same DKIM TXT format under `{selector}._domainkey`.
+/// `pubkey_b64` is the base64 DER of the RSA public key (`keys arc` prints it).
+pub fn arc_record(selector: &str, domain: &str, pubkey_b64: &str) -> DnsRecord {
+    DnsRecord {
+        record_type: "TXT".to_string(),
+        name: format!("{selector}._domainkey.{domain}"),
+        value: format!("v=DKIM1; k=rsa; p={pubkey_b64}"),
+        ttl: 300,
+        purpose: "4ward ARC seal signing".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

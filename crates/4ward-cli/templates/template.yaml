@@ -39,6 +39,22 @@ Parameters:
   RetentionDays:
     Type: Number
     Default: 1
+  RateLimit:
+    Type: Number
+    Default: 100
+    Description: HTTP API steady-state requests/second (stage throttling)
+  Burst:
+    Type: Number
+    Default: 200
+    Description: HTTP API burst limit (stage throttling)
+  ArcSelector:
+    Type: String
+    Default: ""
+    Description: ARC seal selector (empty = no ARC sealing)
+  ArcKeySsm:
+    Type: String
+    Default: ""
+    Description: SSM SecureString parameter holding the ARC RSA private PEM (empty = no ARC sealing)
   ForwarderS3Key:
     Type: String
     Default: bootstrap.zip
@@ -56,6 +72,7 @@ Conditions:
   HasCatchAll: !Not [!Equals [!Ref CatchAll, ""]]
   ApiOn: !Equals [!Ref ApiEnabled, "true"]
   HasRelayDomain: !Not [!Equals [!Ref RelayDomain, ""]]
+  HasArc: !Not [!Equals [!Ref ArcKeySsm, ""]]
 
 Resources:
   RawBucket:
@@ -172,6 +189,12 @@ Resources:
           ALIAS_MAP_JSON: !Ref AliasMapJson
           CATCH_ALL: !Ref CatchAll
           BANNER_ENABLED: !Ref BannerEnabled
+          CONFIG_SET: !Ref MailConfigSet
+          ARC_SELECTOR: !If [HasArc, !Ref ArcSelector, !Ref "AWS::NoValue"]
+          ARC_PRIVATE_KEY: !If
+            - HasArc
+            - !Sub "{{resolve:ssm-secure:${ArcKeySsm}:1}}"
+            - !Ref "AWS::NoValue"
           RUST_LOG: info
 
   ApiFunction:
@@ -198,14 +221,8 @@ Resources:
         Variables:
           ALLOWED_DOMAINS: !Ref AllowedDomains
           API_KEYS_PREFIX: !Ref ApiKeysPrefix
+          CONFIG_SET: !Ref MailConfigSet
           RUST_LOG: info
-
-  ForwarderInvokePermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref ForwarderFunction
-      Action: lambda:InvokeFunction
-      Principal: ses.amazonaws.com
 
   S3InvokePermission:
     Type: AWS::Lambda::Permission
@@ -222,21 +239,20 @@ Resources:
 
   ReceiptRule:
     Type: AWS::SES::ReceiptRule
-    DependsOn: ForwarderInvokePermission
     Properties:
       RuleSetName: !Ref ReceiptRuleSet
       Rule:
         Name: !Sub "${ProjectName}-forward"
         Enabled: true
+        ScanEnabled: true
         Recipients:
           - !Ref DomainName
         Actions:
+          # S3 only: the S3 ObjectCreated event triggers the forwarder.
+          # (A LambdaAction here would double-invoke with a non-S3 event.)
           - S3Action:
               BucketName: !Ref RawBucket
               ObjectKeyPrefix: inbound/
-          - LambdaAction:
-              FunctionArn: !GetAtt ForwarderFunction.Arn
-              InvocationType: Event
 
   HttpApi:
     Type: AWS::ApiGatewayV2::Api
@@ -256,6 +272,9 @@ Resources:
       ApiId: !Ref HttpApi
       StageName: $default
       AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: !Ref Burst
+        ThrottlingRateLimit: !Ref RateLimit
 
   HttpIntegration:
     Type: AWS::ApiGatewayV2::Integration
@@ -282,6 +301,43 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+  BounceTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-bounces"
+
+  ComplaintTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-complaints"
+
+  MailConfigSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Sub "${ProjectName}-mail"
+
+  BounceEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Properties:
+      ConfigurationSetName: !Ref MailConfigSet
+      EventDestination:
+        Name: bounce-to-sns
+        Enabled: true
+        MatchingEventTypes: [bounce]
+        SnsDestination:
+          TopicARN: !Ref BounceTopic
+
+  ComplaintEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Properties:
+      ConfigurationSetName: !Ref MailConfigSet
+      EventDestination:
+        Name: complaint-to-sns
+        Enabled: true
+        MatchingEventTypes: [complaint]
+        SnsDestination:
+          TopicARN: !Ref ComplaintTopic
 
   BounceAlarm:
     Type: AWS::CloudWatch::Alarm

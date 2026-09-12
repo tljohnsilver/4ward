@@ -8,6 +8,9 @@ pub struct DeployArgs {
     pub config: String,
     #[arg(long)]
     pub yes: bool,
+    /// Skip pushing built Lambda code (infra only)
+    #[arg(long)]
+    pub no_code: bool,
 }
 
 #[derive(Args)]
@@ -18,11 +21,25 @@ pub struct DestroyArgs {
     pub yes: bool,
 }
 
-fn alias_map_json(cfg: &fourward_core::FourwardConfig) -> String {
+fn slug(domain: &str) -> String {
+    domain.replace('.', "-")
+}
+
+fn stack_for(cfg: &fourward_core::FourwardConfig, domain: &str) -> String {
+    if cfg.domains.len() == 1 {
+        cfg.aws.stack_name.clone()
+    } else {
+        format!("{}-{}", cfg.aws.stack_name, slug(domain))
+    }
+}
+
+fn alias_map_json(cfg: &fourward_core::FourwardConfig, domain: &str) -> String {
     let mut m = std::collections::HashMap::new();
     for d in &cfg.domains {
-        for (a, dests) in &d.routes {
-            m.insert(format!("{a}@{}", d.domain), dests.clone());
+        if d.domain.eq_ignore_ascii_case(domain) {
+            for (a, dests) in &d.routes {
+                m.insert(format!("{a}@{}", d.domain), dests.clone());
+            }
         }
     }
     serde_json::to_string(&m).unwrap_or("{}".into())
@@ -34,23 +51,44 @@ pub async fn run(args: DeployArgs) -> anyhow::Result<()> {
     // 1. Validate session.
     let sts = aws_sdk_sts::Client::new(&aws_cfg);
     let id = sts.get_caller_identity().send().await?;
-    println!("aws account: {} — deploying {}", id.account().unwrap_or("?"), cfg.aws.stack_name);
+    println!("aws account: {}", id.account().unwrap_or("?"));
 
-    // 2. Try building lambdas (best-effort; stack deploys with placeholder if toolchain missing).
-    try_build_lambdas();
+    // 2. Build lambdas once (best-effort); zips reused for every domain stack.
+    let zips = if args.no_code { Vec::new() } else { try_build_lambdas() };
 
     let cf = aws_sdk_cloudformation::Client::new(&aws_cfg);
-    let domain = cfg.domains.first().map(|d| d.domain.clone()).unwrap_or_default();
+    for d in &cfg.domains {
+        deploy_one(&cf, &aws_cfg, &cfg, d, &zips).await?;
+    }
+    // 3. DNS: Route53 note or ASCII table for external.
+    sync_dns(&aws_cfg, &cfg).await;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn deploy_one(
+    cf: &aws_sdk_cloudformation::Client,
+    aws_cfg: &aws_config::SdkConfig,
+    cfg: &fourward_core::FourwardConfig,
+    d: &fourward_core::DomainConfig,
+    zips: &[(String, Vec<u8>)],
+) -> anyhow::Result<()> {
+    let stack = stack_for(cfg, &d.domain);
+    let (arc_selector, arc_key) = detect_arc(aws_cfg, &d.domain).await;
     let params = vec![
-        ("ProjectName", cfg.project.clone()),
-        ("DomainName", domain.clone()),
-        ("RelayDomain", domain.clone()),
-        ("AliasMapJson", alias_map_json(&cfg)),
-        ("CatchAll", cfg.domains.first().and_then(|d| d.catch_all.clone()).unwrap_or_default()),
+        ("ProjectName", stack.clone()),
+        ("DomainName", d.domain.clone()),
+        ("RelayDomain", d.domain.clone()),
+        ("AliasMapJson", alias_map_json(cfg, &d.domain)),
+        ("CatchAll", d.catch_all.clone().unwrap_or_default()),
         ("BannerEnabled", cfg.settings.banner_enabled.to_string()),
         ("ApiEnabled", cfg.api.enabled.to_string()),
         ("AllowedDomains", cfg.domains.iter().map(|d| d.domain.clone()).collect::<Vec<_>>().join(",")),
         ("RetentionDays", cfg.settings.retention_days.to_string()),
+        ("RateLimit", cfg.api.rate_limit.requests_per_second.to_string()),
+        ("Burst", cfg.api.rate_limit.burst.to_string()),
+        ("ArcSelector", arc_selector),
+        ("ArcKeySsm", arc_key),
     ];
     let parameters: Vec<aws_sdk_cloudformation::types::Parameter> = params
         .into_iter()
@@ -62,11 +100,11 @@ pub async fn run(args: DeployArgs) -> anyhow::Result<()> {
         })
         .collect();
 
-    let exists = cf.describe_stacks().stack_name(&cfg.aws.stack_name).send().await.is_ok();
+    let exists = cf.describe_stacks().stack_name(&stack).send().await.is_ok();
     if exists {
-        println!("updating stack {}…", cfg.aws.stack_name);
+        println!("updating stack {stack}…");
         let r = cf.update_stack()
-            .stack_name(&cfg.aws.stack_name)
+            .stack_name(&stack)
             .template_body(TEMPLATE)
             .set_parameters(Some(parameters))
             .capabilities(aws_sdk_cloudformation::types::Capability::CapabilityIam)
@@ -78,27 +116,26 @@ pub async fn run(args: DeployArgs) -> anyhow::Result<()> {
                 let s = format!("{e:?}");
                 if s.contains("No updates") {
                     println!("no updates to perform");
-                    print_dns(&cfg);
-                    return Ok(());
+                } else {
+                    return Err(e.into());
                 }
-                return Err(e.into());
             }
         }
     } else {
-        println!("creating stack {}…", cfg.aws.stack_name);
+        println!("creating stack {stack}…");
         cf.create_stack()
-            .stack_name(&cfg.aws.stack_name)
+            .stack_name(&stack)
             .template_body(TEMPLATE)
             .set_parameters(Some(parameters))
             .capabilities(aws_sdk_cloudformation::types::Capability::CapabilityIam)
             .send()
             .await?;
     }
-    println!("waiting for stack… (this takes a few minutes)");
+    println!("waiting for {stack}…");
     // Simple poll loop instead of waiters (fewer deps).
     for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-        if let Ok(o) = cf.describe_stacks().stack_name(&cfg.aws.stack_name).send().await {
+        if let Ok(o) = cf.describe_stacks().stack_name(&stack).send().await {
             if let Some(s) = o.stacks().first() {
                 let st = format!("{:?}", s.stack_status());
                 println!("  status: {st}");
@@ -111,23 +148,69 @@ pub async fn run(args: DeployArgs) -> anyhow::Result<()> {
             }
         }
     }
-    // 3. DNS: Route53 auto-update or ASCII table for external.
-    sync_dns(&aws_cfg, &cfg).await;
+    // 4. Push real Lambda code (template ships a placeholder otherwise).
+    if !zips.is_empty() {
+        push_code(aws_cfg, &stack).await;
+    }
     Ok(())
 }
 
-fn try_build_lambdas() {
+/// ARC auto-detect: `keys arc` stores PEM at /4ward/arc/<domain> (+ selector).
+async fn detect_arc(aws_cfg: &aws_config::SdkConfig, domain: &str) -> (String, String) {
+    let ssm = aws_sdk_ssm::Client::new(aws_cfg);
+    let key = format!("/4ward/arc/{domain}");
+    if ssm.get_parameter().name(&key).with_decryption(true).send().await.is_err() {
+        return (String::new(), String::new());
+    }
+    let sel = ssm.get_parameter().name(format!("{key}/selector")).send().await.ok()
+        .and_then(|o| o.parameter().and_then(|p| p.value().map(|s| s.to_string())))
+        .unwrap_or_else(|| "fw1".to_string());
+    println!("ARC key found for {domain} (selector {sel})");
+    (sel, key)
+}
+
+/// Build both lambdas to bootstrap.zip; returns (func_suffix, zip_bytes).
+fn try_build_lambdas() -> Vec<(String, Vec<u8>)> {
     let ok = std::process::Command::new("cargo").arg("lambda").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
     if !ok {
-        println!("cargo-lambda not found — deploying with placeholder code; run `cargo install cargo-lambda` + rebuild for real traffic");
-        return;
+        println!("cargo-lambda not found — deploying with placeholder code; run `cargo install cargo-lambda` for real traffic");
+        return Vec::new();
     }
-    for pkg in ["lambda-forwarder", "lambda-api"] {
+    let mut out = Vec::new();
+    for (pkg, func) in [("lambda-forwarder", "forwarder"), ("lambda-api", "api")] {
         println!("building {pkg} (arm64)…");
-        let st = std::process::Command::new("cargo").args(["lambda", "build", "--arm64", "--release", "--package", pkg]).status();
+        let st = std::process::Command::new("cargo").args(["lambda", "build", "--arm64", "--release", "--package", pkg, "--output-format", "zip"]).status();
         match st {
-            Ok(s) if s.success() => println!("{pkg} built"),
+            Ok(s) if s.success() => {
+                let zip = format!("target/lambda/{pkg}/bootstrap.zip");
+                match std::fs::read(&zip) {
+                    Ok(b) => {
+                        println!("{pkg} built ({} bytes)", b.len());
+                        out.push((func.to_string(), b));
+                    }
+                    Err(_) => println!("{pkg} built but {zip} missing — placeholder kept"),
+                }
+            }
             _ => println!("{pkg} build failed — continuing with placeholder"),
+        }
+    }
+    out
+}
+
+async fn push_code(aws_cfg: &aws_config::SdkConfig, stack: &str) {
+    let lambda = aws_sdk_lambda::Client::new(aws_cfg);
+    // zips rebuilt per deploy; re-read from disk (single source of truth).
+    for (pkg, func) in [("lambda-forwarder", "forwarder"), ("lambda-api", "api")] {
+        let zip = format!("target/lambda/{pkg}/bootstrap.zip");
+        let bytes = match std::fs::read(&zip) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let name = format!("{stack}-{func}");
+        println!("updating code for {name}…");
+        match lambda.update_function_code().function_name(&name).zip_file(aws_sdk_lambda::primitives::Blob::new(bytes)).send().await {
+            Ok(_) => println!("{name} updated"),
+            Err(e) => println!("{name} code update failed: {e:?} (infra is live with previous code)"),
         }
     }
 }
@@ -166,8 +249,9 @@ fn print_dns(cfg: &fourward_core::FourwardConfig) {
 
 pub async fn destroy(args: DestroyArgs) -> anyhow::Result<()> {
     let cfg = load_config(&args.config)?;
+    let stacks: Vec<String> = cfg.domains.iter().map(|d| stack_for(&cfg, &d.domain)).collect();
     if !args.yes {
-        let ok = inquire::Confirm::new(&format!("Delete stack {}?", cfg.aws.stack_name)).with_default(false).prompt()?;
+        let ok = inquire::Confirm::new(&format!("Delete stacks {}?", stacks.join(", "))).with_default(false).prompt()?;
         if !ok {
             println!("aborted");
             return Ok(());
@@ -175,7 +259,9 @@ pub async fn destroy(args: DestroyArgs) -> anyhow::Result<()> {
     }
     let aws_cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let cf = aws_sdk_cloudformation::Client::new(&aws_cfg);
-    cf.delete_stack().stack_name(&cfg.aws.stack_name).send().await?;
-    println!("delete initiated for {}", cfg.aws.stack_name);
+    for stack in &stacks {
+        cf.delete_stack().stack_name(stack).send().await?;
+        println!("delete initiated for {stack}");
+    }
     Ok(())
 }

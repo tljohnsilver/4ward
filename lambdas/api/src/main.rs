@@ -268,9 +268,11 @@ async fn handler(event: Request) -> Result<Response<Body>, Error> {
     let mut to_all = req.to.clone();
     to_all.extend(req.cc.clone());
     to_all.extend(req.bcc.clone());
+    let config_set = std::env::var("CONFIG_SET").ok().filter(|s| !s.trim().is_empty());
     let out = ses
         .send_email()
         .from_email_address(&from_addr)
+        .set_configuration_set_name(config_set)
         .set_destination(Some(
             aws_sdk_sesv2::types::Destination::builder()
                 .set_to_addresses(Some(to_all))

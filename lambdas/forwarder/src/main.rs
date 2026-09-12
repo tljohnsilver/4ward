@@ -5,12 +5,16 @@ use mail_builder::headers::text::Text;
 use mail_parser::{MessageParser, MimeHeaders};
 use std::collections::HashMap;
 
+pub mod arc;
+
 /// Env-driven routing. Keep the Lambda itself stateless:
 /// - `RELAY_DOMAIN`: verified SES identity, e.g. `example.com` (From: relay@domain)
 /// - `ALIAS_MAP_JSON`: `{"support@example.com": ["you@gmail.com"], ...}`
 /// - `CATCH_ALL`: optional fallback destination
 /// - `BANNER_ENABLED`: "true"/"false"
 /// - `LOOP_SALT`: salt for loop-detection hash (defaults to relay domain)
+/// - `CONFIG_SET`: SES configuration set (bounce/complaint tracking)
+/// - `ARC_SELECTOR` + `ARC_PRIVATE_KEY`: first-hop ARC seal RSA PEM (absent = skip)
 pub const LOOP_HEADER: &str = "X-4ward-Loop-Detection";
 
 pub fn loop_hash(domain: &str, salt: &str) -> String {
@@ -96,6 +100,19 @@ pub struct ForwardPlan {
     pub original_to: String,
     pub subject: String,
     pub loop_value: String,
+}
+
+/// Drop mail SES flagged as spam or virus: relaying it burns SES reputation.
+pub fn is_filtered(raw: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(raw).replace("\r\n", "\n");
+    let headers = text.split("\n\n").next().unwrap_or("");
+    headers.lines().any(|l| {
+        match l.split_once(':') {
+            Some((n, v)) if n.trim().eq_ignore_ascii_case("X-SES-Spam-Verdict") => v.contains("FAIL"),
+            Some((n, v)) if n.trim().eq_ignore_ascii_case("X-SES-Virus-Verdict") => v.contains("FAIL"),
+            _ => false,
+        }
+    })
 }
 
 /// Pure planning step — easy to unit test without AWS.
@@ -226,10 +243,30 @@ async fn handle(event: LambdaEvent<S3Event>) -> Result<(), Error> {
             }
             Some(p) => p,
         };
-        let raw = build_forwarded_raw(&bytes, &plan, &relay_domain).map_err(|e| format!("build: {e}"))?;
+        if is_filtered(&bytes) {
+            tracing::warn!("ses spam/virus verdict FAIL, dropping (reputation protection)");
+            continue;
+        }
+        let mut raw = build_forwarded_raw(&bytes, &plan, &relay_domain).map_err(|e| format!("build: {e}"))?;
+        // First-hop ARC seal (fail-open: skip on any error, mail still flows).
+        let arc_sel = std::env::var("ARC_SELECTOR").ok().filter(|s| !s.trim().is_empty());
+        let arc_pem = std::env::var("ARC_PRIVATE_KEY").ok().filter(|s| !s.trim().is_empty());
+        if let (Some(sel), Some(pem)) = (arc_sel, arc_pem) {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            match arc::seal_first_hop(&raw, &relay_domain, &relay_domain, &sel, &pem, now) {
+                Ok(block) => {
+                    let mut sealed = block.into_bytes();
+                    sealed.extend_from_slice(&raw);
+                    raw = sealed;
+                }
+                Err(e) => tracing::warn!(error = %e, "arc seal skipped"),
+            }
+        }
         let relay_from = format!("relay@{relay_domain}");
+        let config_set = std::env::var("CONFIG_SET").ok().filter(|s| !s.trim().is_empty());
         ses.send_email()
             .from_email_address(&relay_from)
+            .set_configuration_set_name(config_set)
             .set_destination(Some(
                 aws_sdk_sesv2::types::Destination::builder()
                     .set_to_addresses(Some(plan.destinations.clone()))
@@ -268,6 +305,17 @@ mod tests {
         format!(
             "From: Carol <carol@example.org>\r\nTo: info@relay.example.com\r\nSubject: with file\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n--{boundary}\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n--{boundary}\r\nContent-Type: application/pdf; name=\"document.pdf\"\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: attachment; filename=\"document.pdf\"\r\n\r\nJVBERi0xLjQK\r\n--{boundary}--\r\n"
         ).into_bytes()
+    }
+
+    #[test]
+    fn spam_verdict_drops() {
+        let bad = b"From: a@b.c\r\nTo: x@y.z\r\nX-SES-Spam-Verdict: FAIL\r\nSubject: t\r\n\r\nbody";
+        assert!(is_filtered(bad));
+        let virus = b"From: a@b.c\r\nTo: x@y.z\r\nX-SES-Virus-Verdict: FAIL\r\nSubject: t\r\n\r\nbody";
+        assert!(is_filtered(virus));
+        let good = b"From: a@b.c\r\nTo: x@y.z\r\nX-SES-Spam-Verdict: PASS\r\nSubject: t\r\n\r\nbody";
+        assert!(!is_filtered(good));
+        assert!(!is_filtered(PLAIN));
     }
 
     #[test]

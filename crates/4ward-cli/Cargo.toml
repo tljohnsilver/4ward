@@ -18,6 +18,9 @@ aws-config = "1"
 aws-sdk-sts = "1"
 aws-sdk-sesv2 = "1"
 aws-sdk-ssm = "1"
+aws-sdk-lambda = "1"
+rsa = { version = "0.9", features = ["sha2"] }
+base64 = { version = "0.22", features = ["std"] }
 aws-sdk-cloudformation = "1"
 aws-sdk-route53 = "1"
 comfy-table = "7"
