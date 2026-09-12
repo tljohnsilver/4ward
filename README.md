@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/brand-hero.svg" width="100%" alt="4ward — zero-idle-cost serverless email infrastructure for AWS, written in Rust" />
+  <img src="docs/assets/banner-lockup.jpg" width="100%" alt="4ward — serverless email infrastructure" />
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
 
 ---
 
-| <img src="docs/assets/icon.svg" width="28" /> **INBOUND — Alias Engine** | **OUTBOUND — Transactional API** |
+| <img src="docs/assets/icon.jpg" width="28" /> **INBOUND — Alias Engine** | **OUTBOUND — Transactional API** |
 |---|---|
 | SES Inbound → S3 (raw MIME, 24h TTL) → Rust Lambda (`arm64`) | `POST /v1/emails` on API Gateway HTTP API → Rust Lambda → SESv2 |
 | SRS rewriting: `Reply-To` keeps the original sender, `From` becomes `"{name} (via {alias})" <relay@{domain}>` | Bearer auth (`4w_live_…`) validated against SSM `/4ward/api-keys/*` (60s cache) |
@@ -80,7 +80,7 @@ crates/4ward-core   config schema + DNS record generation
 crates/4ward-cli    4ward binary (embeds templates/template.yaml)
 lambdas/forwarder   inbound SRS forwarder
 lambdas/api         outbound API
-docs/assets         brand SVGs (recreated from brandkit: #FF7700 #F5F5F7 #0B0C0E #1E2025)
+docs/assets         brand crops (lockup, icon) + architecture diagram
 bin/run.js          npx dispatcher (prebuilt per-platform binary, cargo fallback)
 ```
 

@@ -4,3 +4,4 @@ binaries
 *.zip
 .env
 4ward.json
+brandkit/
