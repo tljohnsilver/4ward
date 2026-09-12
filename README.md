@@ -1,25 +1,59 @@
-# 4ward
+<p align="center">
+  <img src="docs/assets/brand-hero.svg" width="100%" alt="4ward — zero-idle-cost serverless email infrastructure for AWS, written in Rust" />
+</p>
 
-Open-source, zero-idle-cost serverless email engine for AWS, written in Rust. Distributed via `npx 4ward`.
+<p align="center">
+  <a href="https://github.com/tljohnsilver/4ward/actions/workflows/release.yml"><img src="https://github.com/tljohnsilver/4ward/actions/workflows/release.yml/badge.svg" alt="release" /></a>
+  <img src="https://img.shields.io/badge/rust-1.97%2B-%23FF7700?logo=rust" alt="rust 1.97+" />
+  <img src="https://img.shields.io/badge/AWS-SES%20%C2%B7%20Lambda%20arm64-%23232F3E?logo=amazonaws" alt="aws" />
+  <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license: Apache-2.0" />
+  <img src="https://img.shields.io/badge/cost-%240%20idle-green" alt="zero idle cost" />
+</p>
 
-One deployment gives you two capabilities:
+<p align="center"><b>One <code>npx 4ward deploy</code>. Inbound aliases with SPF/DMARC-safe forwarding plus a transactional email API — no servers, no idle bill.</b></p>
 
-1. **Inbound Alias Engine (SRS Forwarder)** — receives mail via SES Inbound, buffers raw MIME in S3 (24h lifecycle), rewrites headers with the Sender Rewriting Scheme, and re-dispatches to personal mailboxes (Gmail, Outlook, …) without failing SPF/DMARC.
-2. **Outbound Transactional REST API** — `POST /v1/emails` on API Gateway HTTP API, backed by a Rust Lambda calling SESv2, with Bearer-token auth and attachment support.
+---
+
+| <img src="docs/assets/icon.svg" width="28" /> **INBOUND — Alias Engine** | **OUTBOUND — Transactional API** |
+|---|---|
+| SES Inbound → S3 (raw MIME, 24h TTL) → Rust Lambda (`arm64`) | `POST /v1/emails` on API Gateway HTTP API → Rust Lambda → SESv2 |
+| SRS rewriting: `Reply-To` keeps the original sender, `From` becomes `"{name} (via {alias})" <relay@{domain}>` | Bearer auth (`4w_live_…`) validated against SSM `/4ward/api-keys/*` (60s cache) |
+| Loop protection, audit headers (`X-Original-From/To`, `X-4ward-Relay`), optional provenance banner | HTML + text, attachments (base64), `from`-domain must be a verified identity |
+| Forwards to Gmail / Outlook / anywhere without breaking SPF/DMARC | Returns `{"id":"<ses-message-id>","status":"sent"}` |
+
+<p align="center">
+  <img src="docs/assets/arch.svg" width="100%" alt="4ward architecture: inbound SES→S3→forwarder→mailbox, outbound API→SESv2" />
+</p>
 
 ## Quickstart
 
 ```bash
-npx 4ward init              # interactive questionnaire → writes 4ward.json
-npx 4ward deploy            # validates AWS session, builds arm64 Lambdas, deploys CloudFormation
-npx 4ward dns               # DNS records (table | --format json|bind)
-npx 4ward keys create prod  # Bearer token → SSM /4ward/api-keys/prod (prints once)
-npx 4ward status            # sandbox mode, 24h quota, enforcement
+npx 4ward init               # questionnaire → 4ward.json
+npx 4ward deploy             # session check → arm64 builds → CloudFormation stack
+npx 4ward dns                # records to copy (table, --format json|bind)
+npx 4ward keys create prod   # token → SSM, printed once
+npx 4ward status             # sandbox? quota? enforcement?
 npx 4ward request-production # automated SES production-access request
-npx 4ward alias list        # hot alias routing editor (set/rm)
+npx 4ward alias set support@example.com a@x.com,b@x.com
 ```
 
-Prerequisites: AWS CLI session with deploy permissions, and `cargo-lambda` + Zig for local Lambda builds (deploy falls back to placeholder code with a warning if missing).
+Needs an AWS CLI session with deploy permissions. Local Lambda builds need `cargo-lambda` + Zig (deploy warns and ships placeholder code without them).
+
+## Send an email
+
+```bash
+curl -X POST "$API/v1/emails" \
+  -H "Authorization: Bearer 4w_live_<token>" \
+  -H 'Content-Type: application/json' -d '{
+    "from": "Acme <alerts@example.com>",
+    "to": ["customer@domain.com"],
+    "reply_to": "support@example.com",
+    "subject": "System Verification",
+    "html": "<p>Your code is: <strong>849201</strong></p>",
+    "text": "Your code is: 849201",
+    "attachments": [{ "filename": "document.pdf", "content": "<base64>", "content_type": "application/pdf" }]
+  }'
+```
 
 ## `4ward.json`
 
@@ -37,45 +71,17 @@ Prerequisites: AWS CLI session with deploy permissions, and `cargo-lambda` + Zig
 }
 ```
 
-`dns_provider` is `"route53"` (records managed for you) or `"external"` (deploy prints the MX/SPF/DKIM/DMARC table to copy).
-
-## Outbound API
-
-```bash
-curl -X POST "$API/v1/emails" \
-  -H "Authorization: Bearer 4w_live_<token>" -H 'Content-Type: application/json' -d '{
-    "from": "Acme <alerts@example.com>",
-    "to": ["customer@domain.com"],
-    "reply_to": "support@example.com",
-    "subject": "System Verification",
-    "html": "<p>Your code is: <strong>849201</strong></p>",
-    "text": "Your code is: 849201",
-    "attachments": [{ "filename": "document.pdf", "content": "<base64>", "content_type": "application/pdf" }]
-  }'
-# → {"id":"<ses-message-id>","status":"sent"}
-```
-
-The `from` domain must be a verified SES identity. Tokens live in SSM under `/4ward/api-keys/*` (cached 60s in-Lambda).
-
-## How forwarding works
-
-SES Receipt Rule → S3 (`inbound/`, SSE-S3, 1-day expiry) + Forwarder Lambda (`arm64`, `provided.al2023`):
-
-- Drops loops via `X-4ward-Loop-Detection`.
-- Sets `Reply-To` to the original sender; `From` becomes `"{name} (via {alias})" <relay@{domain}>`.
-- Stamps `X-Original-From`, `X-Original-To`, `X-4ward-Relay` and an optional provenance banner.
-- Re-sends with `SESv2::SendEmail(Raw)`, preserving text/html bodies and attachments.
-
-CloudWatch alarms ship for bounce rate (>5%) and complaint rate (>0.1%).
+`"route53"` manages records for you; `"external"` prints the MX / SPF / 3× DKIM CNAME / DMARC table to copy. Bounce (>5%) and complaint (>0.1%) CloudWatch alarms ship in the stack.
 
 ## Layout
 
 ```
-crates/4ward-core   config schema (4ward.json) + DNS record generation
-crates/4ward-cli    4ward binary; embeds templates/template.yaml via include_str!
+crates/4ward-core   config schema + DNS record generation
+crates/4ward-cli    4ward binary (embeds templates/template.yaml)
 lambdas/forwarder   inbound SRS forwarder
-lambdas/api         outbound transactional API
-bin/run.js          npx dispatcher (prebuilt binary per platform, cargo fallback)
+lambdas/api         outbound API
+docs/assets         brand SVGs (recreated from brandkit: #FF7700 #F5F5F7 #0B0C0E #1E2025)
+bin/run.js          npx dispatcher (prebuilt per-platform binary, cargo fallback)
 ```
 
 ## Dev
@@ -91,4 +97,4 @@ aws cloudformation validate-template --template-body file://crates/4ward-cli/tem
 
 ## License
 
-See [LICENSE](LICENSE).
+[Apache-2.0](LICENSE).
