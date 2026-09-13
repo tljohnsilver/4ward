@@ -17,13 +17,32 @@
 | <img src="docs/assets/icon.jpg" width="28" /> **INBOUND — Alias Engine** | **OUTBOUND — Transactional API** |
 |---|---|
 | SES Inbound → S3 (raw MIME, 24h TTL) → Rust Lambda (`arm64`) | `POST /v1/emails` on API Gateway HTTP API → Rust Lambda → SESv2 |
-| SRS rewriting: `Reply-To` keeps the original sender, `From` becomes `"{name} (via {alias})" <relay@{domain}>` | Bearer auth (`4w_live_…`) validated against SSM `/4ward/api-keys/*` (60s cache) |
+| SRS-style rewriting: `Reply-To` keeps the original sender, `From` becomes `"{name} (via {alias})" <relay@{domain}>` | Bearer auth (`4w_live_…`) validated against SSM `/4ward/api-keys/*` (60s cache) |
 | Loop protection, audit headers (`X-Original-From/To`, `X-4ward-Relay`), optional provenance banner | HTML + text, attachments (base64), `from`-domain must be a verified identity |
 | Forwards to Gmail / Outlook / anywhere without breaking SPF/DMARC | Returns `{"id":"<ses-message-id>","status":"sent"}` |
 
 <p align="center">
   <img src="docs/assets/arch.svg" width="100%" alt="4ward architecture: inbound SES→S3→forwarder→mailbox, outbound API→SESv2" />
 </p>
+
+## Why 4ward? (vs SaaS)
+
+Email forwarding is a solved problem — but hosted SaaS asks you to rent someone else's infrastructure every month, exactly when a side project can least afford it. 4ward runs the same job inside your own AWS account:
+
+- **100% serverless** — SES, Lambda, API Gateway, S3. Nothing to run, patch, or keep alive.
+- **Your account, your data** — mail, API keys and config live in your AWS account. No third-party SaaS reads, stores, or brokers your email.
+- **$0/month at idle** — send nothing, pay nothing. SES bills strictly per use, and Lambda's always-free tier (1M requests + 400,000 GB-seconds/month) covers the stack at rest.
+- **Deliverability preserved** — SRS-style rewriting keeps SPF/DMARC alignment for your relay domain, and first-hop ARC sealing carries the original authentication results through Gmail/Outlook re-evaluation.
+
+| | Typical SaaS email service | 4ward (your AWS account) |
+|---|---|---|
+| Cost at idle | Fixed subscription from day one | $0 — pay-per-use only |
+| Where your mail lives | Vendor's servers | Your bucket, your functions, your SES identity |
+| Control & portability | Vendor terms and export tools | CloudFormation stack in/out, standard AWS primitives |
+| Quotas & limits | Vendor plan tiers | SES quotas you can raise yourself (`npx 4ward request-production`) |
+| Lock-in | Proprietary pipeline | Open source, Apache-2.0, auditable end to end |
+
+Comparisons are qualitative on purpose — vendor pricing changes constantly, so check current plans yourself. 4ward's own usage costs are AWS pay-per-use (SES, Lambda, S3, API Gateway), which at low volume stays inside the always-free Lambda tier plus pennies of SES.
 
 ## Quickstart
 
@@ -71,7 +90,7 @@ curl -X POST "$API/v1/emails" \
 }
 ```
 
-`"route53"` manages records for you; `"external"` prints the MX / SPF / 3× DKIM CNAME / DMARC table to copy. Bounce (>5%) and complaint (>0.1%) CloudWatch alarms ship in the stack.
+`"route53"` uses your existing hosted zone (auto-detected at deploy; records are printed for you to add); `"external"` prints the same MX / SPF / 3× DKIM CNAME / DMARC table to copy. Bounce (>5%) and complaint (>0.1%) CloudWatch alarms ship in the stack.
 
 ## Layout
 

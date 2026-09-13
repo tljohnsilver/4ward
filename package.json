@@ -2,11 +2,48 @@
   "name": "4ward",
   "version": "0.1.0",
   "description": "Serverless email infrastructure for AWS in Rust",
+  "license": "Apache-2.0",
+  "author": "tljohnsilver <tljohnsilver@users.noreply.github.com>",
+  "homepage": "https://github.com/tljohnsilver/4ward#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tljohnsilver/4ward.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tljohnsilver/4ward/issues"
+  },
+  "keywords": [
+    "aws",
+    "ses",
+    "email",
+    "email-forwarding",
+    "transactional-email",
+    "serverless",
+    "lambda",
+    "rust",
+    "srs",
+    "arc",
+    "spf",
+    "dmarc",
+    "api-gateway"
+  ],
   "bin": {
     "4ward": "./bin/run.js"
   },
+  "files": [
+    "bin/",
+    "scripts/",
+    "crates/",
+    "lambdas/",
+    "docs/assets/",
+    "Cargo.toml",
+    "Cargo.lock"
+  ],
   "scripts": {
     "postinstall": "node ./scripts/install-binary.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "os": ["darwin", "linux", "win32"],
   "cpu": ["x64", "arm64"]

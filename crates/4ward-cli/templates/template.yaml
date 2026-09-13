@@ -77,7 +77,9 @@ Conditions:
 Resources:
   RawBucket:
     Type: AWS::S3::Bucket
+    DependsOn: S3InvokePermission
     Properties:
+      BucketName: !Sub "${ProjectName}-raw-${AWS::AccountId}-${AWS::Region}"
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -92,11 +94,20 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ForwarderFunction.Arn
+            Filter:
+              S3KeyFilter:
+                Rules:
+                  - Name: prefix
+                    Value: inbound/
 
   RawBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
-      Bucket: !Ref RawBucket
+      Bucket: !Sub "${ProjectName}-raw-${AWS::AccountId}-${AWS::Region}"
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -105,7 +116,7 @@ Resources:
             Principal:
               Service: ses.amazonaws.com
             Action: s3:PutObject
-            Resource: !Sub "${RawBucket.Arn}/*"
+            Resource: !Sub "arn:aws:s3:::${ProjectName}-raw-${AWS::AccountId}-${AWS::Region}/*"
 
   EmailIdentity:
     Type: AWS::SES::EmailIdentity
@@ -135,7 +146,7 @@ Resources:
             Statement:
               - Effect: Allow
                 Action: [s3:GetObject]
-                Resource: !Sub "${RawBucket.Arn}/*"
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-raw-${AWS::AccountId}-${AWS::Region}/*"
               - Effect: Allow
                 Action: [ses:SendEmail, ses:SendRawEmail]
                 Resource: "*"
@@ -230,7 +241,7 @@ Resources:
       FunctionName: !GetAtt ForwarderFunction.Arn
       Action: lambda:InvokeFunction
       Principal: s3.amazonaws.com
-      SourceArn: !GetAtt RawBucket.Arn
+      SourceArn: !Sub "arn:aws:s3:::${ProjectName}-raw-${AWS::AccountId}-${AWS::Region}"
 
   ReceiptRuleSet:
     Type: AWS::SES::ReceiptRuleSet
