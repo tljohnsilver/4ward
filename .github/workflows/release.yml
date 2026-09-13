@@ -71,7 +71,7 @@ jobs:
             $(find binaries -type f)
 
   build-lambdas:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
