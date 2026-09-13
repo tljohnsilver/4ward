@@ -42,6 +42,26 @@ jobs:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}
 
+  create-release:
+    needs: [build-cli]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: binaries
+          merge-multiple: true
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "4ward ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            $(find binaries -type f)
+
   build-lambdas:
     runs-on: ubuntu-latest
     steps:
@@ -67,6 +87,18 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org
-      - run: npm publish --access public
+      - name: Check whether version is already on npm
+        id: npmcheck
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if npm view "4ward@${VERSION}" version >/dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "4ward@${VERSION} already on npm - skipping publish."
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish to npm
+        if: steps.npmcheck.outputs.published != 'true'
+        run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
